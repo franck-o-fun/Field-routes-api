@@ -1,0 +1,9 @@
+{
+  "name": "field-routes-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Go-between for the Field routes app and GoHighLevel",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
