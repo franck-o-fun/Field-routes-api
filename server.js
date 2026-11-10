@@ -14,7 +14,13 @@ const ORIGINS = (ENV.ALLOWED_ORIGIN || "*").split(",").map(s => s.trim()).filter
 const PORT = ENV.PORT || 10000;
 const MAX_BODY = 20 * 1024 * 1024;
 
-const FIELDS = { storeId: "Field routes ID", storeNo: "Store number", region: "Region" };
+const FIELDS = {
+  storeId: { name: "Field routes ID", type: "TEXT" }, storeNo: { name: "Store number", type: "TEXT" }, region: { name: "Region", type: "TEXT" },
+  lastOrder: { name: "Dernière commande", type: "DATE" }, lastVisit: { name: "Dernière visite", type: "DATE" }
+};
+const REORDER_DAYS = ENV.REORDER_DAYS != null ? Number(ENV.REORDER_DAYS) : 35;   // 0 turns the task off
+const FOLLOWUP_DAYS = ENV.FOLLOWUP_DAYS != null ? Number(ENV.FOLLOWUP_DAYS) : 21;
+const TASK_ORDER = "Relance commande", TASK_VISIT = "Suivi visite";
 
 /* ---------- GoHighLevel calls ---------- */
 class GhlError extends Error { constructor(status, msg, data) { super(msg); this.status = status; this.data = data; } }
@@ -40,15 +46,24 @@ async function ensureFields() {
   const got = await ghl("GET", `/locations/${LOCATION}/customFields?model=contact`);
   const list = got.customFields || [];
   const ids = {};
-  for (const [k, name] of Object.entries(FIELDS)) {
+  for (const [k, { name, type }] of Object.entries(FIELDS)) {
     let f = list.find(x => String(x.name).trim().toLowerCase() === name.toLowerCase());
     if (!f) {
-      const made = await ghl("POST", `/locations/${LOCATION}/customFields`, { name, dataType: "TEXT", model: "contact" });
+      const made = await ghl("POST", `/locations/${LOCATION}/customFields`, { name, dataType: type, model: "contact" });
       f = made.customField || made;
     }
     ids[k] = f.id;
   }
   fieldIds = ids; return ids;
+}
+// One number field per product on opportunities ("Qté Açaï"...), created the first time that product is ordered.
+let oppFields = null;
+async function oppFieldId(product) {
+  const name = "Qté " + product;
+  if (!oppFields) { const got = await ghl("GET", `/locations/${LOCATION}/customFields?model=opportunity`); oppFields = new Map((got.customFields || []).map(f => [String(f.name).trim().toLowerCase(), f.id])); }
+  const k = name.toLowerCase(); if (oppFields.has(k)) return oppFields.get(k);
+  const made = await ghl("POST", `/locations/${LOCATION}/customFields`, { name, dataType: "NUMERICAL", model: "opportunity" });
+  const id = (made.customField || made).id; oppFields.set(k, id); return id;
 }
 async function findPipeline() {
   if (pipeline !== undefined) return pipeline;
@@ -111,6 +126,29 @@ async function ensureContact(store) {
   }
 }
 
+/* ---------- follow-ups: never block the note or order itself ---------- */
+async function extra(out, label, fn) {
+  try { return await fn(); }
+  catch (e) { console.error(label + ": " + e.message); (out.notices = out.notices || []).push(label + ": " + e.message); return null; }
+}
+async function setDate(contactId, key, date) {
+  const f = await ensureFields();
+  await ghl("PUT", `/contacts/${contactId}`, { customFields: [{ id: f[key], field_value: date }] });
+}
+// Closes any open reminder of the given kinds, then creates the new one.
+async function replaceTask(contactId, closeKinds, kind, storeName, body, fromDate, days) {
+  if (!(days > 0)) return null;
+  const r = await ghl("GET", `/contacts/${contactId}/tasks`);
+  for (const t of r.tasks || []) {
+    if (!t.completed && closeKinds.some(k => String(t.title || "").startsWith(k))) await ghl("PUT", `/contacts/${contactId}/tasks/${t.id}/completed`, { completed: true });
+  }
+  const due = new Date((fromDate || new Date().toISOString().slice(0, 10)) + "T14:00:00Z"); due.setUTCDate(due.getUTCDate() + days);
+  const task = { title: `${kind} · ${storeName || "magasin"}`.slice(0, 120), body, dueDate: due.toISOString(), completed: false };
+  if (ENV.GHL_USER_ID) task.assignedTo = ENV.GHL_USER_ID;
+  const made = await ghl("POST", `/contacts/${contactId}/tasks`, task);
+  return (made.task || made).id;
+}
+
 async function saveNote(p) {
   if (!p.contactId) throw new GhlError(400, "Contact is missing.");
   const urls = (p.photoUrls || []).slice();
@@ -126,7 +164,11 @@ async function saveNote(p) {
     } catch (e) { if (e.status !== 404) throw e; }      // note deleted in GoHighLevel: write a new one
   }
   const made = await ghl("POST", `/contacts/${p.contactId}/notes`, { body: text });
-  return { noteId: (made.note || made).id, photoUrls: urls, updated: false };
+  const out = { noteId: (made.note || made).id, photoUrls: urls, updated: false };
+  await extra(out, "Dernière visite", () => setDate(p.contactId, "lastVisit", p.date));
+  await extra(out, "Task", () => replaceTask(p.contactId, [TASK_VISIT], TASK_VISIT, p.storeName,
+    `Visite du ${p.date}. Repasser ou appeler.\n\n${(p.text || "").trim().slice(0, 500)}`, p.date, FOLLOWUP_DAYS));
+  return out;
 }
 
 async function saveOrder(p) {
@@ -147,11 +189,23 @@ async function saveOrder(p) {
   if (!p.opportunityId) {
     const pl = await findPipeline();
     if (pl) {
-      const opp = await ghl("POST", "/opportunities/", {
+      const body = {
         pipelineId: pl.id, pipelineStageId: pl.stageId, locationId: LOCATION, contactId: p.contactId,
-        name: `Commande ${p.storeName || ""} ${p.date}${p.po ? " PO " + p.po : ""}`.trim(), status: "open", monetaryValue: Math.round(p.total * 100) / 100
+        name: `Commande ${p.storeName || ""} ${p.date}${p.po ? " PO " + p.po : ""}`.trim(), status: (ENV.OPP_STATUS || "open"), monetaryValue: Math.round(p.total * 100) / 100
+      };
+      const qty = await extra(out, "Product fields", async () => {
+        const cf = []; for (const l of p.lines || []) if (l.qty > 0) cf.push({ id: await oppFieldId(l.name), field_value: l.qty }); return cf;
       });
+      let opp;
+      if (qty && qty.length) {
+        try { opp = await ghl("POST", "/opportunities/", Object.assign({}, body, { customFields: qty })); }
+        catch (e) { if (e.status !== 400 && e.status !== 422) throw e; (out.notices = out.notices || []).push("Product quantities refused: " + e.message); }
+      }
+      if (!opp) opp = await ghl("POST", "/opportunities/", body);
       out.opportunityId = (opp.opportunity || opp).id;
+      await extra(out, "Dernière commande", () => setDate(p.contactId, "lastOrder", p.date));
+      await extra(out, "Task", () => replaceTask(p.contactId, [TASK_ORDER, TASK_VISIT], TASK_ORDER, p.storeName,
+        `Dernière commande le ${p.date} : ${money(p.total)}. Vérifier le réassort.`, p.date, REORDER_DAYS));
     } else out.warning = `No pipeline named "${ENV.PIPELINE_NAME || "Commandes"}" in GoHighLevel, so no opportunity was created.`;
   } else out.opportunityId = p.opportunityId;
   return out;
@@ -166,7 +220,9 @@ async function listNotes(contactId) {
 async function check() {
   const out = { location: LOCATION ? "set" : "missing", token: TOKEN ? "set" : "missing", appKey: APP_KEY ? "set" : "missing" };
   if (!TOKEN || !LOCATION) return out;
-  try { await ensureFields(); out.customFields = "ok"; } catch (e) { out.customFields = e.message; }
+  try { await ensureFields(); out.customFields = "ok"; }
+  catch (e) { out.customFields = e.message; }
+  try { await ghl("GET", `/locations/${LOCATION}/customFields?model=opportunity`); out.opportunityFields = "ok"; } catch (e) { out.opportunityFields = e.message; }
   try { const p = await findPipeline(); out.pipeline = p ? `ok (${p.name})` : `not found: create a pipeline named "${ENV.PIPELINE_NAME || "Commandes"}"`; } catch (e) { out.pipeline = e.message; }
   return out;
 }
