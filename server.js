@@ -149,7 +149,7 @@ async function saveOrder(p) {
     if (pl) {
       const opp = await ghl("POST", "/opportunities/", {
         pipelineId: pl.id, pipelineStageId: pl.stageId, locationId: LOCATION, contactId: p.contactId,
-        name: `Commande ${p.storeName || ""} ${p.date}${p.po ? " PO " + p.po : ""}`.trim(), status: "won", monetaryValue: Math.round(p.total * 100) / 100
+        name: `Commande ${p.storeName || ""} ${p.date}${p.po ? " PO " + p.po : ""}`.trim(), status: "open", monetaryValue: Math.round(p.total * 100) / 100
       });
       out.opportunityId = (opp.opportunity || opp).id;
     } else out.warning = `No pipeline named "${ENV.PIPELINE_NAME || "Commandes"}" in GoHighLevel, so no opportunity was created.`;
