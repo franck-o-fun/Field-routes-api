@@ -12,6 +12,7 @@ const APP_KEY = ENV.APP_KEY || "";
 const PIPELINE_NAME = (ENV.PIPELINE_NAME || "Commandes").trim().toLowerCase();
 const ORIGINS = (ENV.ALLOWED_ORIGIN || "*").split(",").map(s => s.trim()).filter(Boolean);
 const PORT = ENV.PORT || 10000;
+const CRM = ENV.CRM_NAME || "La Run CRM";   // name shown to reps in error messages
 const MAX_BODY = 20 * 1024 * 1024;
 
 const FIELDS = {
@@ -33,7 +34,7 @@ async function ghl(method, path, body, isForm) {
     if (r.status === 429 && attempt < 3) { await new Promise(res => setTimeout(res, 1500 * (attempt + 1))); continue; }
     if (!r.ok) {
       const msg = (data && (Array.isArray(data.message) ? data.message.join("; ") : data.message)) || r.statusText;
-      throw new GhlError(r.status, `GoHighLevel ${method} ${path.split("?")[0]} failed (${r.status}): ${msg}`, data);
+      throw new GhlError(r.status, `${CRM} ${method} ${path.split("?")[0]} failed (${r.status}): ${msg}`, data);
     }
     return data || {};
   }
@@ -140,7 +141,8 @@ async function replaceTask(contactId, closeKinds, kind, storeName, body, fromDat
   if (!(days > 0)) return null;
   const r = await ghl("GET", `/contacts/${contactId}/tasks`);
   for (const t of r.tasks || []) {
-    if (!t.completed && closeKinds.some(k => String(t.title || "").startsWith(k))) await ghl("PUT", `/contacts/${contactId}/tasks/${t.id}/completed`, { completed: true });
+    const title = String(t.title || "");
+    if (!t.completed && closeKinds.some(k => k.endsWith(" ·") ? title.startsWith(k) : title === k)) await ghl("PUT", `/contacts/${contactId}/tasks/${t.id}/completed`, { completed: true });
   }
   const due = new Date((fromDate || new Date().toISOString().slice(0, 10)) + "T14:00:00Z"); due.setUTCDate(due.getUTCDate() + days);
   const task = { title: `${kind} · ${storeName || "magasin"}`.slice(0, 120), body, dueDate: due.toISOString(), completed: false };
@@ -166,7 +168,7 @@ async function saveNote(p) {
   const made = await ghl("POST", `/contacts/${p.contactId}/notes`, { body: text });
   const out = { noteId: (made.note || made).id, photoUrls: urls, updated: false };
   await extra(out, "Dernière visite", () => setDate(p.contactId, "lastVisit", p.date));
-  await extra(out, "Task", () => replaceTask(p.contactId, [TASK_VISIT], TASK_VISIT, p.storeName,
+  await extra(out, "Task", () => replaceTask(p.contactId, [TASK_VISIT + " ·"], TASK_VISIT, p.storeName,
     `Visite du ${p.date}. Repasser ou appeler.\n\n${(p.text || "").trim().slice(0, 500)}`, p.date, FOLLOWUP_DAYS));
   return out;
 }
@@ -177,11 +179,11 @@ async function saveOrder(p) {
   if (p.xlsx && !p.fileUrl) out.fileUrl = await upload(p.xlsx, p.fileName || `Bon de commande ${p.date}.xlsx`);
   else out.fileUrl = p.fileUrl || "";
   const min = Number(p.minimum) || 0;
-  const lines = [`Commande ${p.date} · ${p.rep || ""}`.trim()];
+  const lines = [`Commande ${p.company ? p.company + " · " : ""}${p.date} · ${p.rep || ""}`.trim()];
   if (p.po) lines.push(`PO : ${p.po}`);
   if (p.contact) lines.push(`Contact : ${p.contact}`);
   lines.push("");
-  for (const l of p.lines || []) lines.push(`${l.name} ${l.size || ""} × ${l.qty} = ${money(l.qty * l.price)}`.replace(/\s+/g, " "));
+  for (const l of p.lines || []) lines.push(`${l.code ? l.code + " " : ""}${l.name} ${l.size || ""} × ${l.qty} = ${money(l.qty * l.price)}`.replace(/\s+/g, " "));
   lines.push("", `Total : ${money(p.total)}` + (min ? (p.total < min ? ` (sous le minimum de ${money(min)})` : " (minimum atteint)") : ""));
   if (out.fileUrl) lines.push("", "Bon de commande : " + out.fileUrl);
   if (!p.noteId) out.noteId = (await ghl("POST", `/contacts/${p.contactId}/notes`, { body: lines.join("\n") })).note?.id || null;
@@ -193,7 +195,7 @@ async function saveOrder(p) {
         pipelineId: pl.id, pipelineStageId: pl.stageId, locationId: LOCATION, contactId: p.contactId,
         name: `Commande ${p.storeName || ""} ${p.date}${p.po ? " PO " + p.po : ""}`.trim(), status: (ENV.OPP_STATUS || "open"), monetaryValue: Math.round(p.total * 100) / 100
       };
-      const qty = await extra(out, "Product fields", async () => {
+      const qty = p.productFields === false ? null : await extra(out, "Product fields", async () => {
         const cf = []; for (const l of p.lines || []) if (l.qty > 0) cf.push({ id: await oppFieldId(l.name), field_value: l.qty }); return cf;
       });
       let opp;
@@ -204,9 +206,9 @@ async function saveOrder(p) {
       if (!opp) opp = await ghl("POST", "/opportunities/", body);
       out.opportunityId = (opp.opportunity || opp).id;
       await extra(out, "Dernière commande", () => setDate(p.contactId, "lastOrder", p.date));
-      await extra(out, "Task", () => replaceTask(p.contactId, [TASK_ORDER, TASK_VISIT], TASK_ORDER, p.storeName,
+      await extra(out, "Task", () => replaceTask(p.contactId, [`${TASK_ORDER} · ${p.storeName || "magasin"}`.slice(0, 120), TASK_VISIT + " ·"], TASK_ORDER, p.storeName,
         `Dernière commande le ${p.date} : ${money(p.total)}. Vérifier le réassort.`, p.date, REORDER_DAYS));
-    } else out.warning = `No pipeline named "${ENV.PIPELINE_NAME || "Commandes"}" in GoHighLevel, so no opportunity was created.`;
+    } else out.warning = `No pipeline named "${ENV.PIPELINE_NAME || "Commandes"}" in ${CRM}, so no opportunity was created.`;
   } else out.opportunityId = p.opportunityId;
   return out;
 }
@@ -252,7 +254,7 @@ http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   try {
     if (url.pathname === "/" || url.pathname === "/health") return send(res, 200, { ok: true, service: "field-routes-api", ready: !!(TOKEN && LOCATION && APP_KEY) });
-    if (!APP_KEY || req.headers["x-app-key"] !== APP_KEY) return send(res, 401, { error: "Wrong app password. Check it in Reports > GoHighLevel." });
+    if (!APP_KEY || req.headers["x-app-key"] !== APP_KEY) return send(res, 401, { error: `Wrong app password. Check it in Reports > ${CRM}.` });
     if (!TOKEN || !LOCATION) return send(res, 500, { error: "The service is missing GHL_TOKEN or GHL_LOCATION_ID in Render." });
     if (req.method === "GET" && url.pathname === "/api/check") return send(res, 200, await check());
     if (req.method === "GET" && url.pathname === "/api/notes") return send(res, 200, { notes: await listNotes(url.searchParams.get("contactId")) });
@@ -263,6 +265,6 @@ http.createServer(async (req, res) => {
   } catch (e) {
     const code = e.status && e.status < 500 ? (e.status === 401 || e.status === 403 ? 502 : e.status) : 502;
     console.error(e.message, e.data ? JSON.stringify(e.data).slice(0, 500) : "");
-    return send(res, code, { error: e.status === 401 || e.status === 403 ? "GoHighLevel refused the key. Check GHL_TOKEN and its access in Render." : e.message });
+    return send(res, code, { error: e.status === 401 || e.status === 403 ? `${CRM} refused the key. Check GHL_TOKEN and its access in Render.` : e.message });
   }
 }).listen(PORT, () => console.log("field-routes-api on " + PORT));

@@ -29,7 +29,7 @@ WHAT IT CREATES IN GOHIGHLEVEL
     phone already exists, that contact is reused.
   - Visit notes on the contact, photos in the Media library, links in the note.
   - Orders: a note with the lines and total, the Excel in the Media library,
-    and an opportunity (status won, value = total) in the first stage of the
+    and an opportunity (status open, value = total; set OPP_STATUS=won to change) in the first stage of the
     "Commandes" pipeline. Create that pipeline yourself; without it the order
     note is still written.
 
