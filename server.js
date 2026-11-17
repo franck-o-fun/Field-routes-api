@@ -175,9 +175,7 @@ async function saveNote(p) {
 
 async function saveOrder(p) {
   if (!p.contactId) throw new GhlError(400, "Contact is missing.");
-  const out = {};
-  if (p.xlsx && !p.fileUrl) out.fileUrl = await upload(p.xlsx, p.fileName || `Bon de commande ${p.date}.xlsx`);
-  else out.fileUrl = p.fileUrl || "";
+  const out = { fileUrl: p.fileUrl || "" };
   const min = Number(p.minimum) || 0;
   const lines = [`Commande ${p.company ? p.company + " · " : ""}${p.date} · ${p.rep || ""}`.trim()];
   if (p.po) lines.push(`PO : ${p.po}`);
@@ -185,9 +183,16 @@ async function saveOrder(p) {
   lines.push("");
   for (const l of p.lines || []) lines.push(`${l.code ? l.code + " " : ""}${l.name} ${l.size || ""} × ${l.qty} = ${money(l.qty * l.price)}`.replace(/\s+/g, " "));
   lines.push("", `Total : ${money(p.total)}` + (min ? (p.total < min ? ` (sous le minimum de ${money(min)})` : " (minimum atteint)") : ""));
-  if (out.fileUrl) lines.push("", "Bon de commande : " + out.fileUrl);
-  if (!p.noteId) out.noteId = (await ghl("POST", `/contacts/${p.contactId}/notes`, { body: lines.join("\n") })).note?.id || null;
-  else out.noteId = p.noteId;
+  if (!p.noteId) {
+    // A retry must never add a second copy: reuse the same order note if an earlier attempt already wrote it.
+    const same = await extra(out, "Duplicate check", () => findSameOrder(p.contactId, lines.join("\n")));
+    if (same) { out.noteId = same.id; out.fileUrl = out.fileUrl || same.fileUrl; out.reused = true; }
+  } else out.noteId = p.noteId;
+  if (!out.noteId) {
+    if (p.xlsx && !out.fileUrl) out.fileUrl = await upload(p.xlsx, p.fileName || `Bon de commande ${p.date}.xlsx`);
+    if (out.fileUrl) lines.push("", "Bon de commande : " + out.fileUrl);
+    out.noteId = (await ghl("POST", `/contacts/${p.contactId}/notes`, { body: lines.join("\n") })).note?.id || null;
+  }
   if (!p.opportunityId) {
     const pl = await findPipeline();
     if (pl) {
@@ -199,11 +204,25 @@ async function saveOrder(p) {
         const cf = []; for (const l of p.lines || []) if (l.qty > 0) cf.push({ id: await oppFieldId(l.name), field_value: l.qty }); return cf;
       });
       let opp;
-      if (qty && qty.length) {
+      if (out.reused) {   // an earlier attempt got this far: reuse its opportunity rather than making a second one
+        const had = await extra(out, "Opportunity check", async () => {
+          const r = await ghl("GET", `/opportunities/search?location_id=${LOCATION}&contact_id=${encodeURIComponent(p.contactId)}&limit=100`);
+          return (r.opportunities || []).find(o => o.name === body.name && (!o.pipelineId || o.pipelineId === pl.id)) || null;
+        });
+        if (had) { out.opportunityId = had.id; out.alreadyDone = true; return out; }
+      }
+      if (!opp && qty && qty.length) {
         try { opp = await ghl("POST", "/opportunities/", Object.assign({}, body, { customFields: qty })); }
         catch (e) { if (e.status !== 400 && e.status !== 422) throw e; (out.notices = out.notices || []).push("Product quantities refused: " + e.message); }
       }
-      if (!opp) opp = await ghl("POST", "/opportunities/", body);
+      if (!opp) {
+        try { opp = await ghl("POST", "/opportunities/", body); }
+        catch (e) {
+          if (/duplicate opportunit|multiple opportunit/i.test(e.message)) throw new GhlError(409,
+            `${CRM} allows only one opportunity per store. Turn on "Allow multiple opportunities" (Settings > Objects > Opportunities), then tap Sync now. The order note is already saved and will not be repeated.`);
+          throw e;
+        }
+      }
       out.opportunityId = (opp.opportunity || opp).id;
       await extra(out, "Dernière commande", () => setDate(p.contactId, "lastOrder", p.date));
       await extra(out, "Task", () => replaceTask(p.contactId, [`${TASK_ORDER} · ${p.storeName || "magasin"}`.slice(0, 120), TASK_VISIT + " ·"], TASK_ORDER, p.storeName,
@@ -211,6 +230,15 @@ async function saveOrder(p) {
     } else out.warning = `No pipeline named "${ENV.PIPELINE_NAME || "Commandes"}" in ${CRM}, so no opportunity was created.`;
   } else out.opportunityId = p.opportunityId;
   return out;
+}
+
+const stripFile = b => String(b || "").replace(/\r/g, "").split("\n").filter(l => !/^Bon de commande : /.test(l)).join("\n").trim();
+async function findSameOrder(contactId, body) {
+  const want = stripFile(body), r = await ghl("GET", `/contacts/${contactId}/notes`);
+  const n = (r.notes || []).find(x => stripFile(x.body) === want);
+  if (!n) return null;
+  const f = /^Bon de commande : (\S+)/m.exec(n.body || "");
+  return { id: n.id, fileUrl: f ? f[1] : "" };
 }
 
 async function listNotes(contactId) {
@@ -282,6 +310,40 @@ async function storeBrief(storeId, contactId) {
     tasks }, base);
 }
 
+/* ---------- due list: last visit and last order for every store, for the map ---------- */
+let dueCache = null;   // { at, data } kept 5 minutes so several reps opening the map stay under the CRM's rate limit
+async function dueList(fresh) {
+  if (!fresh && dueCache && Date.now() - dueCache.at < 5 * 60e3) return dueCache.data;
+  const f = await ensureFields();
+  const contacts = [];
+  const page = async (n, filters) => (await ghl("POST", "/contacts/search", Object.assign({ locationId: LOCATION, page: n, pageLimit: 100 }, filters ? { filters } : {}))).contacts || [];
+  let filters = [{ field: `customFields.${f.storeId}`, operator: "exists" }];
+  for (let n = 1; n <= 30; n++) {
+    let got;
+    try { got = await page(n, filters); }
+    catch (e) { if (n === 1 && filters && (e.status === 400 || e.status === 422)) { filters = null; got = await page(1, null); } else throw e; }   // no "exists" filter: read every contact
+    contacts.push(...got);
+    if (got.length < 100) break;
+  }
+  const val = (c, id) => { const x = (c.customFields || []).find(y => y.id === id); return x ? (x.value != null ? x.value : (x.fieldValue != null ? x.fieldValue : x.field_value)) : null; };
+  // Some API versions leave custom fields out of search results: read those contacts one at a time.
+  const bare = contacts.filter(c => !Array.isArray(c.customFields));
+  for (let i = 0; i < bare.length; i += 4) {
+    await Promise.all(bare.slice(i, i + 4).map(async c => { try { const g = await ghl("GET", `/contacts/${c.id}`); c.customFields = (g.contact || g).customFields || []; } catch (e) { c.customFields = []; } }));
+    await new Promise(r => setTimeout(r, 250));
+  }
+  const stores = {};
+  for (const c of contacts) {
+    const sid = val(c, f.storeId); if (!sid) continue;
+    const row = { lastVisit: ymd(val(c, f.lastVisit)), lastOrder: ymd(val(c, f.lastOrder)) };
+    const was = stores[sid];   // a store saved twice: keep the newest dates
+    stores[sid] = was ? { lastVisit: [was.lastVisit, row.lastVisit].sort().pop(), lastOrder: [was.lastOrder, row.lastOrder].sort().pop() } : row;
+  }
+  const data = { reorderDays: REORDER_DAYS, followupDays: FOLLOWUP_DAYS, fetchedAt: new Date().toISOString(), stores };
+  dueCache = { at: Date.now(), data };
+  return data;
+}
+
 async function check() {
   const out = { location: LOCATION ? "set" : "missing", token: TOKEN ? "set" : "missing", appKey: APP_KEY ? "set" : "missing" };
   if (!TOKEN || !LOCATION) return out;
@@ -321,7 +383,9 @@ http.createServer(async (req, res) => {
     if (!TOKEN || !LOCATION) return send(res, 500, { error: "The service is missing GHL_TOKEN or GHL_LOCATION_ID in Render." });
     if (req.method === "GET" && url.pathname === "/api/check") return send(res, 200, await check());
     if (req.method === "GET" && url.pathname === "/api/notes") return send(res, 200, { notes: await listNotes(url.searchParams.get("contactId")) });
+    if (req.method === "GET" && url.pathname === "/api/due") return send(res, 200, await dueList(url.searchParams.get("fresh") === "1"));
     if (req.method === "GET" && url.pathname === "/api/store") return send(res, 200, await storeBrief(url.searchParams.get("storeId"), url.searchParams.get("contactId")));
+    if (req.method === "POST") dueCache = null;   // a new note or order changes who is due
     if (req.method === "POST" && url.pathname === "/api/contact") { const b = await readJson(req); return send(res, 200, await ensureContact(b.store)); }
     if (req.method === "POST" && url.pathname === "/api/note") { const b = await readJson(req); return send(res, 200, await saveNote(b)); }
     if (req.method === "POST" && url.pathname === "/api/order") { const b = await readJson(req); return send(res, 200, await saveOrder(b)); }

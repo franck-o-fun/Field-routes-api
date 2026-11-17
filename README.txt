@@ -33,6 +33,16 @@ WHAT IT CREATES IN GOHIGHLEVEL
     "Commandes" pipeline. Create that pipeline yourself; without it the order
     note is still written.
 
+ONE OPPORTUNITY PER ORDER
+  In GoHighLevel turn on "Allow multiple opportunities" (Settings > Objects >
+  Opportunities). Otherwise a store's second order is refused. Retries never
+  repeat the order note or the opportunity.
+
+DUE LIST (app version 12 and up)
+  GET /api/due  last visit and last order for every store in the CRM, so the
+  map can colour who is due. Kept 5 minutes; a new note or order clears it.
+  Nothing is written. No new access needed.
+
 STORE BRIEF (app version 11 and up)
   GET /api/store?storeId=...  reads the store's contact, its visit and order
   notes and its open tasks, so the app can show the history before a visit.
