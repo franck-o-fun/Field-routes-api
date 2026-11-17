@@ -33,6 +33,11 @@ WHAT IT CREATES IN GOHIGHLEVEL
     "Commandes" pipeline. Create that pipeline yourself; without it the order
     note is still written.
 
+STORE BRIEF (app version 11 and up)
+  GET /api/store?storeId=...  reads the store's contact, its visit and order
+  notes and its open tasks, so the app can show the history before a visit.
+  Nothing is written. No new access needed.
+
 CHECK
   https://<service>.onrender.com/health  shows ready: true when all 3 required
   variables are set. The app's "Connect and test" button checks the key, the

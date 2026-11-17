@@ -219,6 +219,69 @@ async function listNotes(contactId) {
     .sort((a, b) => String(b.date).localeCompare(String(a.date))).slice(0, 10);
 }
 
+/* ---------- store brief: what the rep needs before walking in ---------- */
+// GoHighLevel returns dates as "2026-11-05", an ISO string or a timestamp in ms.
+function ymd(v) {
+  if (v == null || v === "") return "";
+  if (typeof v === "number" || /^\d{11,}$/.test(String(v))) { const d = new Date(Number(v)); return isNaN(d) ? "" : d.toISOString().slice(0, 10); }
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v)); if (m) return m[1];
+  const d = new Date(String(v)); return isNaN(d) ? "" : d.toISOString().slice(0, 10);
+}
+const num = s => { const n = Number(String(s || "").replace(/[^\d,.-]/g, "").replace(",", ".")); return isFinite(n) ? n : 0; };
+// Reads back the order and visit notes this service writes (see saveNote and saveOrder).
+function parseNote(n) {
+  const lines = String(n.body || "").replace(/\r/g, "").split("\n");
+  const head = lines[0] || "", created = ymd(n.dateAdded || n.createdAt);
+  let m = /^Commande (?:(.+?) · )?(\d{4}-\d{2}-\d{2})(?:\s*·\s*(.*))?$/.exec(head);
+  if (m) {
+    const o = { kind: "order", id: n.id, company: m[1] || "", date: m[2], rep: (m[3] || "").trim(), po: "", contact: "", lines: [], total: 0, fileUrl: "" };
+    for (const l of lines.slice(1)) {
+      let x;
+      if ((x = /^PO : (.*)$/.exec(l))) o.po = x[1].trim();
+      else if ((x = /^Contact : (.*)$/.exec(l))) o.contact = x[1].trim();
+      else if ((x = /^Total : ([^($]*\$)/.exec(l))) o.total = num(x[1]);
+      else if ((x = /^Bon de commande : (\S+)/.exec(l))) o.fileUrl = x[1];
+      else if ((x = /^(.+?) × (\d+) = (.+)$/.exec(l))) o.lines.push({ label: x[1].trim(), qty: Number(x[2]), amount: num(x[3]) });
+    }
+    return o;
+  }
+  m = /^Visite (\d{4}-\d{2}-\d{2})(?:\s*·\s*(.*))?$/.exec(head);
+  const rest = m ? lines.slice(1) : lines;
+  while (rest.length && rest[0] === "") rest.shift();
+  const pi = rest.lastIndexOf("Photos :");
+  return { kind: "visit", id: n.id, date: m ? m[1] : created, rep: m ? (m[2] || "").trim() : "",
+    text: (pi >= 0 ? rest.slice(0, pi) : rest).join("\n").trim().slice(0, 1500),
+    photos: pi >= 0 ? rest.slice(pi + 1).filter(l => /^https?:\/\//.test(l)).slice(0, 4) : [] };
+}
+async function storeBrief(storeId, contactId) {
+  const base = { reorderDays: REORDER_DAYS, followupDays: FOLLOWUP_DAYS, fetchedAt: new Date().toISOString() };
+  const f = await ensureFields();
+  let contact = null;
+  if (contactId) {
+    try { const c = await ghl("GET", `/contacts/${encodeURIComponent(contactId)}`); contact = c.contact || c; }
+    catch (e) { if (e.status !== 404 && e.status !== 400) throw e; }      // deleted or merged in the CRM: look it up again
+  }
+  if (!contact && storeId) {
+    const id = await searchOne([{ field: `customFields.${f.storeId}`, operator: "eq", value: storeId }]);
+    if (id) { const c = await ghl("GET", `/contacts/${id}`); contact = c.contact || c; }
+  }
+  if (!contact || !contact.id) return Object.assign({ found: false }, base);
+  const cid = contact.id;
+  const [nr, tr] = await Promise.all([ghl("GET", `/contacts/${cid}/notes`), ghl("GET", `/contacts/${cid}/tasks`)]);
+  const cf = new Map((contact.customFields || []).map(x => [x.id, x.value != null ? x.value : (x.fieldValue != null ? x.fieldValue : x.field_value)]));
+  const notes = (nr.notes || []).map(n => Object.assign(parseNote(n), { ts: Date.parse(n.dateAdded || n.createdAt || "") || 0 }))
+    .sort((a, b) => b.date.localeCompare(a.date) || b.ts - a.ts);
+  const today = new Date().toISOString().slice(0, 10);
+  const tasks = (tr.tasks || []).filter(t => !t.completed).map(t => ({ title: String(t.title || ""), due: ymd(t.dueDate) }))
+    .sort((a, b) => (a.due || "9").localeCompare(b.due || "9")).slice(0, 5)
+    .map(t => Object.assign(t, { overdue: !!t.due && t.due < today }));
+  return Object.assign({ found: true, contactId: cid,
+    lastVisit: ymd(cf.get(f.lastVisit)), lastOrder: ymd(cf.get(f.lastOrder)),
+    visits: notes.filter(n => n.kind === "visit").slice(0, 3),
+    orders: notes.filter(n => n.kind === "order").slice(0, 8),
+    tasks }, base);
+}
+
 async function check() {
   const out = { location: LOCATION ? "set" : "missing", token: TOKEN ? "set" : "missing", appKey: APP_KEY ? "set" : "missing" };
   if (!TOKEN || !LOCATION) return out;
@@ -258,6 +321,7 @@ http.createServer(async (req, res) => {
     if (!TOKEN || !LOCATION) return send(res, 500, { error: "The service is missing GHL_TOKEN or GHL_LOCATION_ID in Render." });
     if (req.method === "GET" && url.pathname === "/api/check") return send(res, 200, await check());
     if (req.method === "GET" && url.pathname === "/api/notes") return send(res, 200, { notes: await listNotes(url.searchParams.get("contactId")) });
+    if (req.method === "GET" && url.pathname === "/api/store") return send(res, 200, await storeBrief(url.searchParams.get("storeId"), url.searchParams.get("contactId")));
     if (req.method === "POST" && url.pathname === "/api/contact") { const b = await readJson(req); return send(res, 200, await ensureContact(b.store)); }
     if (req.method === "POST" && url.pathname === "/api/note") { const b = await readJson(req); return send(res, 200, await saveNote(b)); }
     if (req.method === "POST" && url.pathname === "/api/order") { const b = await readJson(req); return send(res, 200, await saveOrder(b)); }
